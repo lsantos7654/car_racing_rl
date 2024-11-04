@@ -1,0 +1,656 @@
+# Reinforcement Learning with PyTorch: CarRacing-v3
+
+```{python}
+# Import necessary libraries
+import gymnasium as gym
+import torch
+import wandb
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from collections import deque
+import random
+import matplotlib.pyplot as plt
+import time
+from IPython.display import clear_output
+import cv2
+import os
+from datetime import datetime
+```
+---
+
+## Part 1: Setup and Introduction
+
+### 1.1 Understanding the Environment
+
+CarRacing-v3 is a continuous control environment where an agent controls a car on a randomly generated track. The environment provides:
+
+- **Observation Space**: 96x96x3 RGB image
+- **Action Space**: 3 continuous values
+  - Steering: [-1, 1]
+  - Gas: [0, 1]
+  - Brake: [0, 1]
+- **Reward**: Track completion percentage minus a small penalty per timestep
+
+### 1.2 PyTorch Basics
+
+PyTorch is a deep learning framework that provides:
+- Automatic differentiation
+- GPU acceleration
+- Dynamic computational graphs
+- Python-first approach
+
+Key PyTorch concepts we'll use:
+- `torch.Tensor`: Multi-dimensional array (similar to numpy)
+- `nn.Module`: Base class for neural networks
+- `nn.Sequential`: Container for layers
+- `optim`: Optimization algorithms
+
+```{python}
+# Create and test the environment
+env = gym.make("CarRacing-v3", render_mode="rgb_array")
+observation, info = env.reset()
+
+# Display sample observation
+plt.figure(figsize=(8, 8))
+# plt.figure(figsize=(36, 36))
+plt.imshow(observation)
+plt.title("Sample Observation")
+plt.axis('off')
+plt.show()
+
+print(f"Observation shape: {observation.shape}")
+print(f"Action space: {env.action_space}")
+```
+
+```{python}
+# Basic PyTorch tensor operations demo
+# Create a random tensor
+x = torch.randn(3, 4)
+print("Random tensor:")
+print(x)
+
+# Basic operations
+print("\nBasic operations:")
+print("Sum:", x.sum())
+print("Mean:", x.mean())
+print("Shape:", x.shape)
+
+# Check for CUDA or Apple Silicon availability
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+print(f"Using device: {device}")
+```
+---
+
+## Part 2: Neural Network Design
+
+### 2.1 Architecture Overview
+
+We'll implement a **Deep Q-Network (DQN)** with the following components:
+1. CNN layers to process the visual input (96x96x3)
+2. Fully connected layers for action prediction
+3. Discrete action space for simplified learning
+
+**Key design choices:**
+- CNN for feature extraction from images
+- ReLU activation for non-linearity
+- Batch normalization for training stability
+- Discretized action space for easier initial learning
+
+**Vocab:**
+- Deep Q-Network (DQN): A neural network architecture that learns to approximate Q-values (expected future rewards) for state-action pairs, used in reinforcement learning
+- Conv2d: 2D convolutional layer that applies learned filters across input images to detect features
+- BatchNorm2d: Normalizes the outputs of a layer across a batch to help with training stability and speed
+- Sequential: A PyTorch container that chains multiple layers together in sequence
+
+**Questions:**
+- **What happens under the hood when I call ReLU in this Sequential block? Are there other blocks? How are the parameters tracked?**
+	- Parameters are tracked through PyTorch's autograd system - each layer's parameters are registered when you inherit from nn.Module
+- **Is the forward method required to be defined/overwritten?**
+	- Yes, forward() must be defined in any custom nn.Module
+	- It defines how data flows through your network
+	- When you call model(input), PyTorch actually calls model.forward(input)
+- **What was the purpose of specifying the dummy_input?**
+	- This performs a "dry run" to calculate the size of the flattened CNN output before it hits the fully connected layers. Without this, you wouldn't know the correct input size for the first linear layer.
+- **Why 512?**
+	- 512 is a chosen hyperparameter for the hidden layer size
+	- Common choices are powers of 2 (128, 256, 512, 1024)
+	- This is somewhat arbitrary and could be tuned:
+		- Larger = more capacity but slower training
+		- Smaller = faster but might underfit
+
+```{python}
+class DQN(nn.Module):
+    def __init__(self, n_actions, input_channels=3):
+        super(DQN, self).__init__()
+        
+        # CNN layers for processing visual input
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(input_channels, 32, kernel_size=8, stride=4),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU()
+        )
+        
+        # Calculate the size of flattened features
+        # We'll use a dummy forward pass
+        dummy_input = torch.zeros(1, input_channels, 96, 96)
+        conv_out = self.conv_layers(dummy_input)
+        self.fc_input_dim = conv_out.view(1, -1).size(1)
+        
+        # Fully connected layers
+        self.fc_layers = nn.Sequential(
+            nn.Linear(self.fc_input_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions)
+        )
+
+    def forward(self, x):
+        # x shape: (batch_size, channels, height, width)
+        conv_out = self.conv_layers(x)
+        flattened = conv_out.view(conv_out.size(0), -1)
+        return self.fc_layers(flattened)
+
+# Create a discretized action space
+class DiscreteActions:
+    def __init__(self):
+        # Define discrete actions as numpy arrays
+        self.actions = [
+            np.array([-1.0, 0.0, 0.0], dtype=np.float64),  # Full left
+            np.array([-0.5, 0.0, 0.0], dtype=np.float64),  # Half left
+            np.array([0.0, 0.0, 0.0], dtype=np.float64),   # Straight
+            np.array([0.5, 0.0, 0.0], dtype=np.float64),   # Half right
+            np.array([1.0, 0.0, 0.0], dtype=np.float64),   # Full right
+            np.array([0.0, 1.0, 0.0], dtype=np.float64),   # Full gas
+            np.array([0.0, 0.5, 0.0], dtype=np.float64),   # Half gas
+            np.array([0.0, 0.0, 0.5], dtype=np.float64),   # Light brake
+            np.array([0.0, 0.0, 1.0], dtype=np.float64),   # Full brake
+            np.array([-0.5, 0.5, 0.0], dtype=np.float64),  # Left + gas
+            np.array([0.5, 0.5, 0.0], dtype=np.float64),   # Right + gas
+        ]
+        self.n_actions = len(self.actions)
+
+    def get_action(self, index):
+        return self.actions[index]
+
+# Initialize action space and network
+discrete_actions = DiscreteActions()
+model = DQN(n_actions=discrete_actions.n_actions)
+
+print("Model architecture:")
+print(model)
+
+# (Batch_size, Channels, Height, Width)
+# Or memorized as:
+# (N, C, H, W)
+
+# Test forward pass
+test_input = torch.randn(1, 3, 96, 96)
+test_output = model(test_input)
+print(f"\nTest output shape: {test_output.shape}")
+```
+
+### 2.2 Network Components Explained
+
+1. **Convolutional Layers**:
+   - First layer: 32 filters, 8x8 kernel, stride 4
+   - Second layer: 64 filters, 4x4 kernel, stride 2
+   - Third layer: 64 filters, 3x3 kernel, stride 1
+   - Each followed by batch normalization and ReLU
+
+**Vocab**
+- Filters (output channels): Number of feature detectors. Each filter learns to detect different patterns
+- Kernel Size: The size of the sliding window that looks at the input. Larger kernels see more context at once
+- Stride: How many pixels the kernel moves each step. Larger strides reduce spatial dimensions faster
+
+**This architecture follows common CNN design patterns:**
+- Gradually decrease spatial dimensions
+- Gradually increase number of filters
+- Reduce kernel size as you go deeper
+- Keep stride=1 in later layers
+
+**Progression Logic**
+```
+Input: 96x96x3
+↓ (Conv1: 8x8s4) → 23x23x32
+↓ (Conv2: 4x4s2) → 10x10x64
+↓ (Conv3: 3x3s1) → 8x8x64
+
+Output_size = [(Input_size - Kernel_size) / Stride] + 1
+```
+
+2. **Fully Connected Layers**:
+   - Flattened CNN output → 512 neurons
+   - Final layer: 512 → number of discrete actions
+
+3. **Action Space**:
+   - Discretized into 7 basic actions
+   - Combines steering, acceleration, and braking
+   - Simplifies the learning process for initial implementation 
+
+
+#### Small Notes on ResNet
+**Benefits:**
+- Easier Optimization: The identity skip connection provides a direct path for gradients
+- Reduces Vanishing Gradient: Short paths from early to later layers
+- Better Performance: Deeper networks become practically trainable
+
+[ResNet](residual_networks.qmd)
+```
+Input
+     ↓
+  [Conv Layer]
+     ↓
+  [BatchNorm]
+     ↓
+    [ReLU]
+     ↓
+  [Conv Layer]
+     ↓
+  [BatchNorm]
+     ↓    ↘
+     +  ←  Skip Connection (x)
+     ↓
+    [ReLU]
+```
+
+**ResNet Benefit Analysis for Our Case**
+
+1. **Depth Consideration**
+   - Our network is relatively shallow (3-4 main blocks)
+   - Original ResNet paper showed benefits primarily in networks of 20+ layers
+   - Degradation problem typically appears in deeper networks
+
+2. **Computational Cost vs Benefit**
+   - Adding residual connections increases computation
+   - Adds complexity to the model
+   - In shallow networks, simple skip connections might add overhead without significant benefits
+
+3. **Our Use Case**
+   - Car racing environment needs real-time processing
+   - Input (96x96x3) is relatively small
+   - Task requires more focus on temporal dynamics than ultra-deep feature extraction
+
+---
+
+## Part 3: Experience Replay and Training Setup
+
+### 3.1 Components Overview
+
+1. **Replay Buffer**: 
+   - Stores transitions (state, action, reward, next_state, done)
+   - Enables random sampling for training
+   - Breaks correlation between consecutive samples
+
+2. **Epsilon-Greedy Strategy**:
+   - Balances exploration and exploitation
+   - Epsilon decays over time to reduce random actions
+
+3. **Training Utilities**:
+   - Loss function (MSE)
+   - Optimizer (Adam)
+   - Frame preprocessing
+
+```{python}
+import torch.nn.functional as F
+from collections import namedtuple, deque
+import cv2
+
+# Define transition tuple structure
+Transition = namedtuple('Transition',
+                       ('state', 'action', 'reward', 'next_state', 'done'))
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.memory = deque(maxlen=capacity)
+        
+    def push(self, *args):
+        self.memory.append(Transition(*args))
+    
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+    
+    def __len__(self):
+        return len(self.memory)
+
+def preprocess_frame(frame):
+    # Convert to grayscale and normalize
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    frame = cv2.resize(frame, (96, 96))
+    frame = frame / 255.0
+    return torch.FloatTensor(frame).unsqueeze(0)  # Add channel dimension
+
+class DQNTrainer:
+    def __init__(self, model, target_model, discrete_actions, 
+                 learning_rate=3e-4, gamma=0.99, 
+                 epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=0.997):
+        self.model = model
+        self.target_model = target_model
+        self.discrete_actions = discrete_actions
+        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        
+        self.gamma = gamma
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        
+        self.memory = ReplayBuffer(300000)  # Capacity of 100k transitions
+        self.batch_size = 32
+        
+    def select_action(self, state):
+        if random.random() > self.epsilon:
+            with torch.no_grad():
+                state = state.unsqueeze(0)  # Add batch dimension
+                q_values = self.model(state)
+                action_idx = q_values.max(1)[1].item()
+        else:
+            action_idx = random.randrange(self.discrete_actions.n_actions)
+        
+        return action_idx
+    
+    def update_epsilon(self):
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+    
+    def train_step(self):
+        if len(self.memory) < self.batch_size:
+            return
+        
+        transitions = self.memory.sample(self.batch_size)
+        batch = Transition(*zip(*transitions))
+        
+        # Convert to tensors and reshape
+        state_batch = torch.cat(batch.state).view(self.batch_size, 1, 96, 96)
+        action_batch = torch.tensor(batch.action)
+        reward_batch = torch.tensor(batch.reward)
+        next_state_batch = torch.cat(batch.next_state).view(self.batch_size, 1, 96, 96)
+        done_batch = torch.tensor(batch.done)
+        
+        # Compute current Q values
+        current_q_values = self.model(state_batch).gather(1, action_batch.unsqueeze(1))
+        
+        # Compute next Q values using target network
+        with torch.no_grad():
+            next_q_values = self.target_model(next_state_batch).max(1)[0]
+            next_q_values[done_batch] = 0.0
+            expected_q_values = reward_batch + self.gamma * next_q_values
+        
+        # Compute loss and update
+        loss = F.smooth_l1_loss(current_q_values.squeeze(), expected_q_values)
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss.item()
+
+    def update_target_network(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+```
+
+```{python}
+# Initialize trainer
+model = DQN(n_actions=discrete_actions.n_actions, input_channels=1)  # 1 channel for grayscale
+target_model = DQN(n_actions=discrete_actions.n_actions, input_channels=1)
+target_model.load_state_dict(model.state_dict())
+
+trainer = DQNTrainer(model, target_model, discrete_actions)
+
+# Test the setup
+env = gym.make("CarRacing-v3", render_mode="rgb_array")
+state, _ = env.reset()
+processed_state = preprocess_frame(state)
+action_idx = trainer.select_action(processed_state)
+action = discrete_actions.get_action(action_idx)
+
+print(f"Processed state shape: {processed_state.shape}")
+print(f"Selected action index: {action_idx}")
+print(f"Actual action values: {action}")
+```
+
+## Part 4: Training Loop and Monitoring
+
+### 4.1 Training Process
+- Episodes run until termination or maximum steps
+- States are preprocessed into grayscale
+- Performance is tracked with running rewards
+- Model is periodically saved
+- Target network updated at intervals
+
+```{python}
+class TrainingMetrics:
+    def __init__(self, project_name="car-racing-rl", experiment_name=None):
+        # Create unique run name if none provided
+        if experiment_name is None:
+            experiment_name = f"dqn-training-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        
+        # Initialize wandb with explicit configuration
+        wandb.init(
+            project=project_name,
+            name=experiment_name,
+            config={
+                "architecture": "DQN",
+                "learning_rate": trainer.optimizer.param_groups[0]['lr'],
+                "epsilon_start": trainer.epsilon,
+                "epsilon_end": trainer.epsilon_end,
+                "epsilon_decay": trainer.epsilon_decay,
+                "batch_size": trainer.batch_size,
+                "gamma": trainer.gamma,
+                "environment": "CarRacing-v3"
+            },
+            reinit=True  # Allow reinitializing runs
+        )
+        
+        self.experiment_name = experiment_name
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.running_reward = 0
+        self.best_reward = float('-inf')
+    
+    def update(self, episode_reward, episode_length, loss=None, epsilon=None):
+        self.episode_rewards.append(episode_reward)
+        self.episode_lengths.append(episode_length)
+        self.running_reward = 0.05 * episode_reward + 0.95 * self.running_reward
+        self.best_reward = max(self.best_reward, episode_reward)
+        
+        # Log to wandb
+        wandb.log({
+            "episode_reward": episode_reward,
+            "episode_length": episode_length,
+            "running_reward": self.running_reward,
+            "best_reward": self.best_reward,
+            "loss": loss if loss is not None else 0,
+            "epsilon": epsilon if epsilon is not None else 0
+        })
+    
+    def finish(self):
+        wandb.finish()
+
+def train(env, trainer, metrics, num_episodes=1000, max_steps=1000, 
+          target_update=10, render_interval=100):
+    
+    env = gym.make("CarRacing-v3", render_mode="human")
+
+    for episode in range(num_episodes):
+        state, _ = env.reset()
+        state = preprocess_frame(state)
+        episode_reward = 0
+        episode_loss = 0
+        steps = 0
+        prev_reward = 0  # Track previous reward for shaping
+        
+        for step in range(max_steps):
+            action_idx = trainer.select_action(state)
+            action = trainer.discrete_actions.get_action(action_idx)
+            next_state, reward, done, truncated, _ = env.step(action)
+            
+            # Reward shaping
+            shaped_reward = reward
+            if reward > prev_reward:  # Reward improvement
+                shaped_reward += 0.5
+            if abs(action[0]) > 0.8:  # Penalize extreme steering
+                shaped_reward -= 0.1
+            
+            prev_reward = reward
+            
+            next_state = preprocess_frame(next_state)
+            episode_reward += reward
+            
+            trainer.memory.push(state, action_idx, reward, next_state, done)
+            
+            state = next_state
+            
+            loss = trainer.train_step()
+            if loss is not None:
+                episode_loss += loss
+            
+            steps = step + 1
+            if done or truncated:
+                break
+        
+        if episode % target_update == 0:
+            trainer.update_target_network()
+        
+        trainer.update_epsilon()
+        
+        # Update metrics with more information
+        metrics.update(
+            episode_reward=episode_reward,
+            episode_length=steps,
+            loss=episode_loss/steps if steps > 0 else 0,
+            epsilon=trainer.epsilon
+        )
+        
+        # Save model to wandb
+        if episode_reward > metrics.best_reward:
+            model_path = f"model_episode_{episode}.pth"
+            torch.save(trainer.model.state_dict(), model_path)
+            wandb.save(model_path)
+            
+    metrics.finish()
+    return metrics
+```
+
+```{python}
+# Test wandb setup
+metrics = TrainingMetrics(project_name="car-racing-rl")
+print(f"WandB run initialized: {wandb.run.name}")
+
+# Test logging
+metrics.update(
+    episode_reward=0,
+    episode_length=0,
+    loss=0,
+    epsilon=1.0
+)
+print("Test logging complete")
+```
+
+Now lets run the Training
+```{python}
+# Initialize environment and metrics
+env = gym.make("CarRacing-v3", render_mode="rgb_array")
+metrics = TrainingMetrics()
+
+# Training configuration
+config = {
+    'num_episodes': 500,
+    'max_steps': 1000,
+    'target_update': 5,
+    'render_interval': 50
+}
+
+# Start training
+print("Starting training...")
+start_time = time.time()
+
+metrics = train(env, trainer, metrics, **config)
+
+training_time = time.time() - start_time
+print(f"\nTraining completed in {training_time/60:.2f} minutes")
+
+# Final plot
+metrics.plot_metrics()
+```
+
+#### wandb common graph meaning
+- **best_reward**: The highest reward achieved so far during training. Increasing trend is good, shows the agent is learning to achieve better performance.
+- **loss**: The error in the neural network's predictions. Shows how much the model's predictions deviate from the target values. Lower is generally better, but some fluctuation is normal.
+- **episode_reward**: The total reward obtained in each episode. Higher values mean better performance in that specific episode. Shows high variance which is normal in RL.
+- **episode_length**: How many steps each episode lasted. Here it's constant at 1000, meaning episodes are hitting the max_steps limit.
+- **epsilon**: The exploration rate, decreasing over time as per the epsilon decay. Starts high (more random actions) and decreases (more learned actions).
+- **running_reward**: A smoothed average of episode rewards. Shows the overall trend in performance better than raw episode rewards. Currently showing a downward trend, suggesting the agent might need some hyperparameter tuning.
+
+```{python}
+def evaluate_trained_agent(model, n_episodes=5, render=True):
+    # Create environment with human render mode
+    eval_env = gym.make("CarRacing-v3", render_mode="human")
+    
+    for episode in range(n_episodes):
+        state, _ = eval_env.reset()
+        total_reward = 0
+        done = False
+        
+        while not done:
+            state_tensor = preprocess_frame(state)
+            
+            # Get action from model
+            with torch.no_grad():
+                q_values = model(state_tensor.unsqueeze(0))
+                action_idx = q_values.max(1)[1].item()
+                action = discrete_actions.get_action(action_idx)
+            
+            # Take step in environment
+            state, reward, done, truncated, _ = eval_env.step(action)
+            total_reward += reward
+            
+            if truncated:
+                break
+        
+        print(f"Episode {episode + 1} Reward: {total_reward:.2f}")
+    
+    eval_env.close()
+```
+
+```{python}
+# Function to visualize agent's performance
+def evaluate_agent(model, env, discrete_actions, num_episodes=5):
+    model.eval()
+    
+    for episode in range(num_episodes):
+        state, _ = env.reset()
+        total_reward = 0
+        
+        while True:
+            state_tensor = preprocess_frame(state)
+            
+            with torch.no_grad():
+                q_values = model(state_tensor.unsqueeze(0))
+                action_idx = q_values.max(1)[1].item()
+                
+            action = discrete_actions.get_action(action_idx)
+            state, reward, done, truncated, _ = env.step(action)
+            total_reward += reward
+            
+            if done or truncated:
+                break
+                
+        print(f"Episode {episode + 1} Reward: {total_reward:.2f}")
+
+# Create evaluation environment
+eval_env = gym.make("CarRacing-v3", render_mode="human")
+print("\nEvaluating trained agent...")
+evaluate_agent(model, eval_env, discrete_actions)
+evaluate_trained_agent(trainer.model)
+```

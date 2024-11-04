@@ -1,0 +1,103 @@
+## ResNet Architecture Overview
+
+### What are Residual Networks?
+Residual Networks (ResNets) address the degradation problem in deep neural networks. As networks get deeper, they become harder to train due to vanishing gradients and optimization difficulties.
+
+### Key Concepts:
+
+1. **Residual Block**
+   - Instead of learning a direct mapping H(x), learn a residual function F(x) = H(x) - x
+   - The network only needs to learn the difference (residual) from the input
+   - Formula: output = F(x) + x (where x is the "skip connection")
+
+```{python}
+class ResBlock(nn.Module):
+    def __init__(self, in_channels):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(in_channels)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        identity = x
+        
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        out += identity  # Skip connection
+        out = self.relu(out)
+        
+        return out
+
+class ResDQN(nn.Module):
+    def __init__(self, n_actions, input_channels=3):
+        super(ResDQN, self).__init__()
+        
+        # Initial convolution
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(input_channels, 32, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(32),
+            nn.ReLU()
+        )
+        
+        # Residual blocks
+        self.res_blocks = nn.Sequential(
+            ResBlock(32),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # Downsample
+            ResBlock(64),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),  # Downsample
+            ResBlock(64)
+        )
+        
+        # Calculate the size of flattened features
+        dummy_input = torch.zeros(1, input_channels, 96, 96)
+        conv_out = self.conv1(dummy_input)
+        conv_out = self.res_blocks(conv_out)
+        self.fc_input_dim = conv_out.view(1, -1).size(1)
+        
+        # Fully connected layers
+        self.fc_layers = nn.Sequential(
+            nn.Linear(self.fc_input_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions)
+        )
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.res_blocks(x)
+        x = x.view(x.size(0), -1)
+        return self.fc_layers(x)
+
+# Initialize the ResNet version
+model = ResDQN(n_actions=discrete_actions.n_actions)
+print("ResNet Model architecture:")
+print(model)
+
+# Test forward pass
+test_input = torch.randn(1, 3, 96, 96)
+test_output = model(test_input)
+print(f"\nTest output shape: {test_output.shape}")
+```
+
+### Key Differences in our ResNet Implementation:
+
+1. **ResBlock Class**:
+   - Contains two convolutional layers with batch normalization
+   - Implements the skip connection
+   - Maintains feature map dimensions using padding
+
+2. **Architecture Changes**:
+   - Initial convolution with larger kernel for better feature capture
+   - Multiple residual blocks with downsampling in between
+   - Preserved the same fully connected head for action prediction
+
+3. **Advantages for CarRacing**:
+   - Better feature extraction from visual input
+   - More stable training due to residual connections
+   - Potentially better handling of spatial relationships in the image
