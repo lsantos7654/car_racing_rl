@@ -1,0 +1,6 @@
+gymnasium
+pygame
+numpy
+torch
+opencv-python
+wandb
